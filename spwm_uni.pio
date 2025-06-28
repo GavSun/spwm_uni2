@@ -1,0 +1,327 @@
+/*
+Notes for PIO usage
+PIO use sequence:
+1) Load the state machine program into instruction memory,
+2) Configures the state machine and perform IO mapping.
+3) Then set the state machines running.
+4) From this point on, the state machines run autonomous. 
+   - Interact with the state machine once it is running.(through DMA, interrupts & control registers)
+
+The main parts involved are:
+• A PIO program
+• Some software, written in C, to run the whole show
+• A CMake file describing how these two are combined into a program image to load onto a RP-series
+microcontroller based development board
+
+- Each PIO block (i.e. 4 State Machines in it) has 32 slot instruction memory. (shared)
+
+- The PIO supports only nine instructions: JMP, WAIT, IN, OUT, PUSH, PULL, MOV, IRQ, and SET
+On every system clock cycle, each state machine fetches, decodes and executes one instruction. 
+Each instruction takes precisely one cycle, unless it explicitly stalls (such as the WAIT instruction).
+Instructions may insert a delay of up to 31 cycles before the next instruction execute, 
+to help write cycle-exact programs.
+
+Each state machine has a pair of 4-word deep FIFOs, 
+- one for data transfer from system to state machine (TX), 
+- and the other for state machine to system (RX).
+- it is possible to areange the two FIFOs into a single 8-word FIFO for one direction.
+
+FIFOs also generate data request (DREQ) signals, which allow a system DMA controller 
+to pace its reads/writes based on the presence of data in an RX FIFO, 
+or space for new data in a TX FIFO.
+*/
+
+.pio_version 0 // only requires PIO version 0
+
+//-------------------------------------------------------------------
+// The program below puts a 50HZ square waveform on SYNC_OUT pin.
+// Before starting the program the ISR is preloaded with duration of 
+// ON period (same is used for OFF period as well).
+// This program uses contents of ISR for delay generation.
+//-------------------------------------------------------------------
+.program sync_out
+.side_set 1 opt         ;Reserve 1 pin from delay group for 50Hz sync output
+.wrap_target
+    mov x, isr side 1   ;copy ISR into X. it is ON Time of SYNC_OUT. Set the SYNC_OUT
+del0:
+    jmp x--, del0       ;delay till ON time is finished.
+    mov x, isr  side 0  ;copy ISR into X. it is OFF Time of SYNC_OUT. Reset the SYNC_OUT
+del1:
+    jmp x--, del1       ;delay till OFF time is finished.
+.wrap                   ;start again
+
+//------------------------------------------------
+//A helper function to set up a PIO and it's state machine for correct execution of sync_out ASM program
+% c-sdk {
+    static inline void sync_out_program_init(PIO pio, uint sm, uint offset, float clkdiv, uint pin_base, uint pin_count) {
+    
+        //Get the default configuration & modify it before loading into the state machine.
+        pio_sm_config c = sync_out_program_get_default_config(offset);
+    
+        // Configure a GPIO for use by PIO
+        //pio_gpio_init(pio, pin_base);
+        for(uint i=pin_base; i<pin_base+pin_count; i++) {
+            pio_gpio_init(pio, i);
+        }
+        
+        // Sets the pins direction to OUT, starting at 'pin_base'.
+        pio_sm_set_consecutive_pindirs(pio, sm, pin_base, pin_count, true);
+
+        // ****** 
+        // IMPORTANT: Manage overlapping of GPIO pins between SIDE_SET, SET, OUT groups 
+        // *****
+
+        // Set the "SIDE-SET group" pins starting at 'pin_base'.
+        // The pin_count in side-set group are to be specified at the start of assembley program.
+        sm_config_set_sideset_pins(&c, pin_base);
+
+        // Set the "SET group" pin_count, starting at'pin_base'
+        // sm_config_set_set_pins(&c, pin_base, pin_count);
+
+        // Set the "OUT group" pin_count, starting at'pin_base'
+        // sm_config_set_out_pins(&c, pin_base, pin_count);
+
+        // Set the "JUMP group" starting at'pin_base'
+        // sm_config_set_jmp_pin(&c, pin); // for JMP instruction
+
+        // Set the "IN group" starting at'pin_base'
+        // sm_config_set_in_pins(&c, pin_base); //for WAIT instruction
+
+        //-------------------------------------------------
+
+        // Set OSR for shifting to right side & Autopull OFF.
+        //sm_config_set_out_shift(&c, true, false, 0);
+        
+        // Set ISR
+        // sm_config_set_in_shift(&c, false, true, n_bits);
+    
+        //---------------------------------------------------
+
+        // Join Tx & Rx Fifo of SM to form a 8 word buffer to be used only for Tx purpose
+        //sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+
+        // Set PIO clock (common to all SM)
+        sm_config_set_clkdiv(&c, clkdiv);
+
+        // Now configure the PIO & SM with this new configuration and go to the start address (offset)
+        pio_sm_init(pio, sm, offset, &c);
+
+        //------------------------------------------------------
+
+        // And start the state machine now! 
+        // NOTE: for synchronised pin behaviour, the SMs can be enabled simultaniously
+        // through the main application.
+        //pio_sm_set_enabled(pio, sm, true); 
+    }
+%}
+
+// ----------------------------------------------------------------------------------
+// This program generates 2 SPWM complentary outputs for the 1st half of H bridge inverter.
+// The ON & OFF duration is supplied by the application through SM's TX FIFO using DMA.
+// The DEAD_TIME is added by this program while changing the logic levels of the GPIO pins.
+// The DEAD_TIME is preloaded in ISR before starting this program.
+// ----------------------------------------------------------------------------------
+.program spwm_h1
+.side_set 2 opt             ;Reserve 2 pins from delay group for SPWM output
+.wrap_target
+    pull   side 0b10        ;Pull first value from FIFO into OSR. (stalls if FIFO is empty)
+    mov x, osr              ;copy OSR into X. It is ON duration for low side switch.
+delay0:
+    jmp x--, delay0         ;delay till pulse duration is finished.
+    mov x, isr side 0b00    ;copy DEAD_TIME from ISR into X.
+delay1:
+    jmp x--, delay1         ;delay till dead time is complete.
+    pull   side 0b01        ;Pull the next value from FIFO into OSR. (stalls if FIFO is empty)
+    mov x, osr              ;copy OSR into X. It is ON duration for high side switch.
+delay2:
+    jmp x--, delay2         ;delay till pulse duration is finished.
+    mov x, isr  side 0b00   ;copy OSR into X.
+delay3:
+    jmp x--, delay3         ;delay till dead time is complete.
+.wrap
+
+//------------------------------------------------------------------------------
+// A helper function to correctly initialise the PIO and it's state machine
+// before starting the execution of the 'spwm_h1' assembley program.
+// -----------------------------------------------------------------------------
+% c-sdk {
+    static inline void spwm_h1_program_init(PIO pio, uint sm, uint offset, float clkdiv, uint pin_base, uint pin_count) {
+    
+        //Get the default configuration & modify it before loading into the state machine.
+        pio_sm_config c = spwm_h1_program_get_default_config(offset);
+    
+        // Configure a GPIO for use by PIO
+        //pio_gpio_init(pio, pin_base);
+        for(uint i=pin_base; i<pin_base+pin_count; i++) {
+            pio_gpio_init(pio, i);
+        }
+        
+        // Sets the pins direction to OUT, starting at 'pin_base'.
+        pio_sm_set_consecutive_pindirs(pio, sm, pin_base, pin_count, true);
+
+        // ****** 
+        // IMPORTANT: Manage overlapping of GPIO pins between SIDE_SET, SET, OUT groups 
+        // *****
+
+        // Set the "SIDE-SET group" pins starting at 'pin_base'.
+        // The pin_count in side-set group are to be specified at the start of assembley program.
+        sm_config_set_sideset_pins(&c, pin_base);
+
+        // Set the "SET group" pin_count, starting at'pin_base'
+        // sm_config_set_set_pins(&c, pin_base, pin_count);
+
+        // Set the "OUT group" pin_count, starting at'pin_base'
+        // sm_config_set_out_pins(&c, pin_base, pin_count);
+
+        // Set the "JUMP group" starting at'pin_base'
+        // sm_config_set_jmp_pin(&c, pin); // for JMP instruction
+
+        // Set the "IN group" starting at'pin_base'
+        // sm_config_set_in_pins(&c, pin_base); //for WAIT instruction
+
+        //-------------------------------------------------
+
+        // Set OSR for shifting to right side & Autopull OFF.
+        //sm_config_set_out_shift(&c, true, false, 0);
+        
+        // Set ISR
+        // sm_config_set_in_shift(&c, false, true, n_bits);
+    
+        //---------------------------------------------------
+
+        // Join Tx & Rx Fifo of SM to form a 8 word buffer to be used only for Tx purpose
+        sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+
+        // Set PIO clock (specific to this SM)
+        sm_config_set_clkdiv(&c, clkdiv);
+
+        // Now configure the PIO & SM with this new configuration and go to the start address (offset)
+        pio_sm_init(pio, sm, offset, &c);
+
+        //--------------------------------------------------
+        // This section applicable only for this assembly program
+        // Clear TX & RX FIFO
+        //pio_sm_clear_fifos (pio, sm);
+        
+        // Put a 'DEAD_TIME' into TX FIFO 
+        //pio_sm_put (pio, sm, 48);
+        
+        // Pull the 'DEAD_TIME' into OSR
+        //pio_sm_exec(pio, sm, pio_encode_pull(false, false));
+        
+        // Copy OSR contents into ISR
+        //pio_sm_exec(pio, sm, pio_encode_out(pio_isr, 32));
+        //------------------------------------------------------
+
+        // And start the state machine now! 
+        // NOTE: for achieving synchronisation on IO pins, the SMs can be enabled simultaniously
+        // through the main application.
+        //pio_sm_set_enabled(pio, sm, true); 
+    }
+%}
+
+// ----------------------------------------------------------------------------------
+// This program generates 2 SPWM complentary outputs for the 2nd half of H bridge inverter.
+// The ON & OFF durations of SPWM wave are supplied by the application through SM's TX FIFO using DMA.
+// The DEAD_TIME is added by this program while changing the logic levels of the GPIO pins.
+// The DEAD_TIME is preloaded in ISR before starting this program.
+// ----------------------------------------------------------------------------------
+.program spwm_h2
+.side_set 2 opt             ;Reserve 2 pins from delay group for SPWM output
+.wrap_target
+    pull   side 0b10        ;Pull first value from FIFO into OSR. (stalls if FIFO is empty)
+    mov x, osr              ;copy OSR into X. it is pulse duration
+d0:
+    jmp x--, d0             ;delay till pulse duration is finished.
+    mov x, isr side 0b00    ;copy OSR into X.
+d1:
+    jmp x--, d1             ;delay till dead time is complete.
+    pull   side 0b01        ;Pull next value from FIFO into OSR. (stalls if FIFO is empty)
+    mov x, osr              ;copy OSR into X. it is pulse duration
+d2:
+    jmp x--, d2             ;delay till pulse duration is finished.
+    mov x, isr side 0b00    ;copy OSR into X.
+d3:
+    jmp x--, d3             ;delay till dead time is complete.
+.wrap
+
+//------------------------------------------------------------------------------
+// A helper function to correctly initialise the PIO and it's state machine
+// before starting the execution of the 'spwm_h1' assembley program.
+// -----------------------------------------------------------------------------
+% c-sdk {
+    static inline void spwm_h2_program_init(PIO pio, uint sm, uint offset, float clkdiv, uint pin_base, uint pin_count) {
+    
+        //Get the default configuration & modify it before loading into the state machine.
+        pio_sm_config c = spwm_h2_program_get_default_config(offset);
+    
+        // Configure a GPIO for use by PIO
+        //pio_gpio_init(pio, pin_base);
+        for(uint i=pin_base; i<pin_base+pin_count; i++) {
+            pio_gpio_init(pio, i);
+        }
+        
+        // Sets the pins direction to OUT, starting at 'pin_base'.
+        pio_sm_set_consecutive_pindirs(pio, sm, pin_base, pin_count, true);
+
+        // ****** 
+        // IMPORTANT: Manage overlapping of GPIO pins between SIDE_SET, SET, OUT groups 
+        // *****
+
+        // Set the "SIDE-SET group" pins starting at 'pin_base'.
+        // The pin_count in side-set group are to be specified at the start of assembley program.
+        sm_config_set_sideset_pins(&c, pin_base);
+
+        // Set the "SET group" pin_count, starting at'pin_base'
+        // sm_config_set_set_pins(&c, pin_base, pin_count);
+
+        // Set the "OUT group" pin_count, starting at'pin_base'
+        // sm_config_set_out_pins(&c, pin_base, pin_count);
+
+        // Set the "JUMP group" starting at'pin_base'
+        // sm_config_set_jmp_pin(&c, pin); // for JMP instruction
+
+        // Set the "IN group" starting at'pin_base'
+        // sm_config_set_in_pins(&c, pin_base); //for WAIT instruction
+
+        //-------------------------------------------------
+
+        // Set OUT shift for shifting to right side & Autopull OFF.
+        // sm_config_set_out_shift(&c, true, false, 0);
+        
+        // Set IN shift 
+        // sm_config_set_in_shift(&c, false, true, n_bits);
+    
+        //---------------------------------------------------
+
+        // Join Tx & Rx Fifo of SM to form a 8 word buffer to be used only for Tx purpose
+        sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+
+        // Set PIO clock (specific to this SM)
+        sm_config_set_clkdiv(&c, clkdiv);
+
+        // Now configure the PIO & SM with this new configuration and go to the start address (offset)
+        pio_sm_init(pio, sm, offset, &c);
+
+        //--------------------------------------------------
+        // This section applicable only for this assembly program
+        // Clear TX & RX FIFO
+        //pio_sm_clear_fifos (pio, sm);
+        
+        // Put a 'DEAD_TIME' into TX FIFO 
+        //pio_sm_put (pio, sm, 48);
+        
+        // Pull the 'DEAD_TIME' into OSR
+        //pio_sm_exec(pio, sm, pio_encode_pull(false, false));
+        
+        // Copy OSR contents into ISR
+        //pio_sm_exec(pio, sm, pio_encode_out(pio_isr, 32));
+        //------------------------------------------------------
+
+        // And start the state machine now! 
+        // NOTE: for synchronised pin behaviour, the SMs can be enabled simultaniously
+        // through the main application.
+        //pio_sm_set_enabled(pio, sm, true); 
+    }
+%}
+
