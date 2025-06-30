@@ -6,34 +6,12 @@
 #include "hardware/pio.h"
 //#include "hardware/uart.h"
 
-
 //includes from this project
 #include "spwm_lut.h"
 
 //Our assembly program
 #include "spwm_uni.pio.h"
 
-/*
-// This example uses the default led pin
-// Change this by defining HELLO_PIO_LED_PIN to use a different gpio
-#if !defined HELLO_PIO_LED_PIN && defined PICO_DEFAULT_LED_PIN
-#define HELLO_PIO_LED_PIN PICO_DEFAULT_LED_PIN
-#endif
-
-// Check the pin is compatible with the platform
-#if HELLO_PIO_LED_PIN >= NUM_BANK0_GPIOS
-#error Attempting to use a pin>=32 on a platform that does not support it
-#endif
-
-// UART defines -By default the stdout UART is `uart0`, so we will use the second one
-#define UART_ID uart1
-#define BAUD_RATE 115200
-
-// Use pins 4 and 5 for UART1
-// Pins can be changed, see the GPIO function select table in the datasheet for information on GPIO assignments
-#define UART_TX_PIN 4
-#define UART_RX_PIN 5
-*/
 //MCU RP2350 GPIO pins on PICO2 used for full bridge drive
 #define PICO2_PIN_GP14 14   //H1_HIGH
 #define PICO2_PIN_GP15 15   //H1_LOW
@@ -53,13 +31,11 @@ uint32_t __attribute__ ((aligned(BUFFER_SIZE))) spwm_h1_high_table[BUFFER_SIZE/4
 uint32_t __attribute__ ((aligned(BUFFER_SIZE))) spwm_h2_high_table[BUFFER_SIZE/4]; //Array size = 512
 
 uint32_t h1_sync_count, h2_sync_count;
-//uint32_t  __attribute__ ((aligned(8))) flash_led_50hz[2] = { 1000000, 1000000}; //, 1000000, 1000000 };
 
 //-----------------------------------------------
 //      Constants used in this Application
 //-----------------------------------------------
 // Configurable constants before compilation
-//#define TRIWAVE_DURATION 78.12e-6f
 #define SIGNAL_FREQ 50
 #define MOD_INDEX_MA 0.8f
 #define MOD_INDEX_MF 256
@@ -121,7 +97,6 @@ void configure_dma_for_pio(PIO pio_spwm, uint sm_spwm, int dc, dma_channel_confi
 
 int main()
 {
-    
     stdio_init_all();
     sleep_ms(10000);
     
@@ -139,8 +114,9 @@ int main()
     uint32_t diff_time = (uint32_t)(end_time - start_time);
     printf("Exec Time : %d\n", diff_time);
     
-    //The values in the lookup tables must be adjusted for DEADTIME & execution delays.
-    //DEAD_TIME is the time when both the switches must be off before one of them switches ON.
+    //The values in the lookup tables must be corrected for DEADTIME & execution delays.
+    //DEAD_TIME is required prevent shoot through during the time when one switch is turning OFF 
+    //while other is turning ON. 
     //Execution delay is the delay introduced by the assembly instructions in PIO program.
     printf("%3d SPWM1: %5d", -1, h1_sync_count);
     h1_sync_count = h1_sync_count - DEAD_TIME - IE_DELAY_COMPENSATION;
@@ -159,6 +135,7 @@ int main()
         printf(" : %5d\n",spwm_h2_high_table[i]);
     }
     
+    //The sync_out_half_duration is the corrected value for half duration of the main signal i.e. The 50Hz
     uint32_t sync_out_half_duration = ((signal_duration/2)-DEADTIME_COMPENSATION);
 
     printf("Lookup table computation complete....\n");
@@ -183,9 +160,9 @@ int main()
     bool success = pio_claim_free_sm_and_add_program_for_gpio_range(&spwm_h1_program, &pio, &sm[0], &offset[0], PICO2_PIN_GP14, 2, true); 
     if(!success) {printf("NO PIO or SM for H1 halfbridge..\n");}
     hard_assert(success);
+    
     // Configure pio to run the assembley program, and start it, using the helper function in .pio file.
     spwm_h1_program_init(pio, sm[0], offset[0], clkdiv, PICO2_PIN_GP14, 2); 
-    //The pio and SM ready but not enabled yet.
     printf("SPWM Output on pico2 board -> H1_hi:GP%d H1_lo:GP%d\n", PICO2_PIN_GP14, PICO2_PIN_GP15); 
     
     //Load the "DEAD_TIME' into ISR PIO,  it will be inserted while changing the hi & lo side swiches
@@ -207,8 +184,10 @@ int main()
     success = pio_claim_free_sm_and_add_program_for_gpio_range(&spwm_h2_program, &pio, &sm[1], &offset[1], PICO2_PIN_GP16, 2, false);
     if(!success) {printf("NO PIO or SM for H2 halfbridge..\n");}
     hard_assert(success);
-    printf("SPWM Output on pico2 board -> H2_hi:GP%d H2_lo:GP%d\n", PICO2_PIN_GP16, PICO2_PIN_GP17);
+    
+    // Configure pio to run the assembley program, and start it, using the helper function in .pio file.
     spwm_h2_program_init(pio, sm[1], offset[1], clkdiv, PICO2_PIN_GP16, 2);
+    printf("SPWM Output on pico2 board -> H2_hi:GP%d H2_lo:GP%d\n", PICO2_PIN_GP16, PICO2_PIN_GP17);
 
     //Load the "DEAD_TIME'into ISR, to be inserted while changing the state of hi & lo side swiches
     pio_sm_clear_fifos (pio, sm[1]);    //Clear TX & RX FIFO
